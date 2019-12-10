@@ -569,6 +569,82 @@ abstract class ZStream[-R, +E, +O](val process: ZManaged[R, Nothing, ZIO[R, Opti
   }
 
   /**
+   * Chunks the stream into fixed-size chunks by passing a sliding window over the elements.
+   * This is the ZStream equivalent of [[scala.collection.IterableLike.sliding(Int)]], where `step` is set to 1.
+   * @param size size of the chunk
+   */
+  def sliding(size: Int): ZStreamChunk[R, E, A] =
+    sliding(size, 1)
+
+  /**
+   * Chunks the stream into fixed-size chunks by passing a sliding window over the elements.
+   * This is the ZStream equivalent of [[scala.collection.IterableLike.sliding(Int, Int)]].
+   * @param size size of the chunk (> 0)
+   * @param step distance between the first elements of successive chunks (> 0)
+   */
+  def sliding(size: Int, step: Int): ZStreamChunk[R, E, A] =
+    ZStreamChunk {
+      ZStream {
+        val _size = size max 1
+        val _step = step max 1
+        for {
+          as        <- self.process
+          doneRef   <- Ref.make(false).toManaged_
+          dirtyRef  <- Ref.make(true).toManaged_
+          bufferRef <- Ref.make[Chunk[A]](Chunk.empty).toManaged_
+
+          pull = {
+            def loop: Pull[R, E, Chunk[A]] =
+              for {
+                done  <- doneRef.get
+                dirty <- dirtyRef.get
+                result <- {
+                  if (done) {
+                    if (!dirty) Pull.end
+                    else {
+                      dirtyRef.set(false) *>
+                        bufferRef.get.flatMap { buf =>
+                          if (buf.nonEmpty && buf.length < _size) Pull.emit(buf)
+                          else loop
+                        }
+                    }
+                  } else {
+                    as.foldM(
+                      success = { a =>
+                        bufferRef.update(_ + a).flatMap { buf =>
+                          if (buf.length < _size) {
+                            loop
+                          } else if (buf.length == _size) {
+                            Pull.emit(buf)
+                          } else if (_step <= _size) {
+                            val buf_ = buf.drop(_step)
+                            bufferRef.set(buf_) *> {
+                              if (buf_.length == _size) Pull.emit(buf_)
+                              else loop
+                            }
+                          } else if (_step > _size) {
+                            UIO.when(buf.length == _step) {
+                              bufferRef.update(_.drop(_step))
+                            } *> loop
+                          } else Pull.end
+                        }
+                      },
+                      failure = {
+                        case Some(e) => Pull.fail(e)
+                        case _       => doneRef.set(true) *> loop
+                      }
+                    )
+                  }
+                }
+              } yield result
+
+            loop
+          }
+        } yield pull
+      }
+    }
+
+  /**
    * Performs a filter and map in a single step.
    */
   def collect[O1](pf: PartialFunction[O, O1]): ZStream[R, E, O1] =
